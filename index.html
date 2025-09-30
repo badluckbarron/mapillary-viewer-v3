@@ -42,11 +42,11 @@
   <script>
     // ------------------ Query/options ------------------
     const qs = new URLSearchParams(location.search);
-    const TOKEN = qs.get("token") || "";
+    const TOKEN = qs.get("token") || "MLY%7C24462366120070331%7C7b445698e786aaa212354b607653e542";
     const defaults = {
-      lat: Number(qs.get("lat") ?? 30.147146),
-      lng: Number(qs.get("lng") ?? -91.961231),
-      z:   Number(qs.get("z")   ?? 12),
+      lat: Number(qs.get("lat") ?? 30.138307),
+      lng: Number(qs.get("lng") ?? -91.965153),
+      z:   Number(qs.get("z")   ?? 16),
       username: (qs.get("username") || "HKocen").trim()
     };
     const VIEW          = (qs.get("view") || "image").toLowerCase();     // image | map | split
@@ -87,6 +87,28 @@
       radius: 4, color: '#1b5e20', weight: 2, opacity: 1,
       fillColor: '#2ecc71', fillOpacity: 0.9, className: 'pin'
     };
+
+    // === HIGHLIGHT CHANGES ===
+    const selectedPinStyle = {
+      radius: 8, color: '#e53935', weight: 3, opacity: 1,
+      fillColor: '#ffcdd2', fillOpacity: 1.0, className: 'pin-selected'
+    };
+    /** Map of imageId -> Leaflet CircleMarker */
+    let pinsById = new Map();
+    /** Currently selected CircleMarker (or null) */
+    let selectedPin = null;
+
+    function styleDefault(layer){ try{ layer.setStyle(defaultPinStyle); }catch{} }
+    function styleSelected(layer){ try{ layer.setStyle(selectedPinStyle); layer.bringToFront(); }catch{} }
+
+    function selectPinById(imageId){
+      const lyr = pinsById.get(imageId);
+      if(!lyr) return;
+      if(selectedPin && selectedPin !== lyr) styleDefault(selectedPin);
+      styleSelected(lyr);
+      selectedPin = lyr;
+    }
+    // === END HIGHLIGHT CHANGES ===
 
     // ------------------ Helpers ------------------
     function bboxFromMap(m){ const b=m.getBounds(), sw=b.getSouthWest(), ne=b.getNorthEast(); return [sw.lng, sw.lat, ne.lng, ne.lat]; }
@@ -138,7 +160,7 @@
     }
 
     async function fetchImagesInBbox({bbox, cap=MAX_PINS}){
-      const PAGE=100; let out=[];
+      const PAGE=2000; let out=[];
       let url=new URL("https://graph.mapillary.com/images");
       url.searchParams.set("fields","id,computed_geometry");
       url.searchParams.set("bbox", bbox.join(","));
@@ -159,12 +181,28 @@
       try{
         const images=await fetchImagesInBbox({bbox:bboxFromMap(map)});
         pinLayer.clearLayers();
+
+        // === HIGHLIGHT CHANGES ===
+        pinsById = new Map();
+        selectedPin = null;
+        // === END HIGHLIGHT CHANGES ===
+
         for(const img of images){
           const c=img?.computed_geometry?.coordinates; if(!c) continue;
           const latlng=[c[1],c[0]];
-          L.circleMarker(latlng, defaultPinStyle)
-            .on('click', (e)=>{ L.DomEvent.stop(e); if(viewer) gotoImage(img.id, latlng); })
+          const pin = L.circleMarker(latlng, defaultPinStyle)
+            .on('click', (e)=>{
+              L.DomEvent.stop(e);
+              // highlight immediately
+              selectPinById(img.id);
+              // and move viewer
+              if(viewer) gotoImage(img.id, latlng);
+            })
             .addTo(pinLayer);
+
+          // === HIGHLIGHT CHANGES ===
+          pinsById.set(img.id, pin);
+          // === END HIGHLIGHT CHANGES ===
         }
         status(`Pins: ${images.length}`);
       }catch(e){ console.error(e); status("Error loading pins."); }
@@ -176,7 +214,13 @@
       try{
         status("Finding image near click…");
         const img=await findImageNear({lat:e.latlng.lat, lng:e.latlng.lng});
-        if(img){ await gotoImage(img.id, [e.latlng.lat, e.latlng.lng]); status(""); }
+        if(img){
+          // === HIGHLIGHT CHANGES ===
+          selectPinById(img.id);
+          // === END HIGHLIGHT CHANGES ===
+          await gotoImage(img.id, [e.latlng.lat, e.latlng.lng]);
+          status("");
+        }
         else status("No image found there.");
       }catch(err){ console.error(err); status("Error searching."); }
     });
@@ -271,6 +315,11 @@
       try{
         suspendWatcher = true;
         await viewer.moveTo(id);
+
+        // === HIGHLIGHT CHANGES ===
+        if (SHOW_PINS) selectPinById(id);
+        // === END HIGHLIGHT CHANGES ===
+
         if(latlngHint){
           marker.setLatLng([latlngHint[0], latlngHint[1]]);
           if(FOLLOW_MAP && VIEW!=='image') map.setView(latlngHint, map.getZoom(), {animate:true});
@@ -304,6 +353,11 @@
             marker.setLatLng(latlng);
             if(FOLLOW_MAP && VIEW!=='image') map.setView(latlng, map.getZoom(), {animate:true});
           }
+
+          // === HIGHLIGHT CHANGES ===
+          if (SHOW_PINS) selectPinById(id);
+          // === END HIGHLIGHT CHANGES ===
+
           await reanchorToSticky();
         });
       } catch {}
@@ -315,6 +369,11 @@
         marker.setLatLng(latlng0);
         if(FOLLOW_MAP && VIEW!=='image') map.setView(latlng0, map.getZoom(), {animate:true});
       }
+
+      // === HIGHLIGHT CHANGES ===
+      if (SHOW_PINS) selectPinById(start.id);
+      // === END HIGHLIGHT CHANGES ===
+
       await reanchorToSticky();         // anchor to START_BEARING (default 0°)
       status("");
 
