@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – sticky wedge + marker follows viewer</title>
+  <title>MapillaryJS – sticky wedge + marker follows viewer (rotSign)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -42,20 +42,23 @@
   <script>
     // ------------------ Query/options ------------------
     const qs = new URLSearchParams(location.search);
-    const TOKEN = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const TOKEN = qs.get("token") || "";
     const defaults = {
       lat: Number(qs.get("lat") ?? 30.147146),
       lng: Number(qs.get("lng") ?? -91.961231),
       z:   Number(qs.get("z")   ?? 12),
       username: (qs.get("username") || "HKocen").trim()
     };
-    const VIEW        = (qs.get("view") || "image").toLowerCase();     // image | map | split
-    const SHOW_PINS   = (qs.get("pins") || "").toLowerCase() === "all";
-    const FOV_DEG     = Number(qs.get("fov") ?? 60);
-    const DEBUG       = qs.get("debug") === "1";
-    const MAX_PINS    = Number(qs.get("maxPins") ?? 500);
+    const VIEW          = (qs.get("view") || "image").toLowerCase();     // image | map | split
+    const SHOW_PINS     = (qs.get("pins") || "").toLowerCase() === "all";
+    const FOV_DEG       = Number(qs.get("fov") ?? 60);
+    const DEBUG         = qs.get("debug") === "1";
+    const MAX_PINS      = Number(qs.get("maxPins") ?? 2000);
     const START_BEARING = ((Number(qs.get("bearing")) || 0) + 360) % 360; // default 0°
-    const FOLLOW_MAP  = (qs.get("follow") ?? "1") !== "0";               // auto-pan map (default on)
+    const FOLLOW_MAP    = (qs.get("follow") ?? "1") !== "0";              // auto-pan map (default on)
+
+    // +1 => wedge follows north arrow; -1 => wedge follows camera yaw (opposite of north arrow)
+    const ROT_SIGN = (qs.get("rotSign") === "-1" ? -1 : 1);
 
     const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
     const dbg    = (t)=>{ const el=document.getElementById('dbg'); if (DEBUG){ el.style.display='block'; el.textContent=t; } };
@@ -117,7 +120,6 @@
       const j=await res.json(); return j?.data?.[0] ?? null;
     }
 
-    // NEW: read lat/lng for an image id
     async function getImageLatLng(imageId){
       const u=new URL(`https://graph.mapillary.com/${imageId}`);
       u.searchParams.set("fields","computed_geometry");
@@ -126,8 +128,6 @@
       const c=j?.computed_geometry?.coordinates;
       return Array.isArray(c) && c.length===2 ? [c[1], c[0]] : null;
     }
-
-    // NEW: move marker (and optionally pan map) to an image
     async function setMarkerToImage(imageId){
       const latlng = await getImageLatLng(imageId);
       if(!latlng) return;
@@ -204,7 +204,6 @@
         return null;
       }
     }
-
     function getCompassRotation(){
       const host=document.getElementById('mly');
       const trySel=(sel,src)=>{ const el=host && host.querySelector(sel); const deg=getRotationDeg(el);
@@ -217,7 +216,6 @@
         {rot:null, src:'none'}
       );
     }
-
     async function readStableCompassRotation(maxWaitMs=3500){
       const t0=performance.now(); let last=null, stable=0; let result={rot:null,src:'none'};
       while(performance.now()-t0<maxWaitMs){
@@ -234,7 +232,7 @@
 
     // ------------------ Sticky wedge logic ------------------
     let viewer, navLock=0;
-    let compassOffset=0;              // wedgeBearing = (compassOffset + rot) % 360
+    let compassOffset=0;              // wedgeBearing = (compassOffset + ROT_SIGN*rot) % 360
     let stickyBearing=START_BEARING;  // keep angle across photos
     let suspendWatcher=false;         // pause live updates during anchoring
 
@@ -243,10 +241,11 @@
       await nextFrame();                         // ensure new image is mounted
       const {rot, src} = await readStableCompassRotation();
       if(rot!=null){
-        compassOffset = ((stickyBearing - rot) % 360 + 360) % 360;
+        // Apply ROT_SIGN so we anchor against the desired rotation direction
+        compassOffset = ((stickyBearing - ROT_SIGN * rot) % 360 + 360) % 360;
         const p=marker.getLatLng();
         drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
-        if (DEBUG) dbg(`reanchor\nrot=${rot.toFixed(1)}°\nsticky=${stickyBearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}`);
+        if (DEBUG) dbg(`reanchor\nrot=${rot.toFixed(1)}°\nsticky=${stickyBearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}\nrotSign=${ROT_SIGN}`);
       }
       suspendWatcher = false;
     }
@@ -256,11 +255,12 @@
         if(suspendWatcher) return;
         const {rot, src} = getCompassRotation();
         if(rot==null) return;
-        const bearing = (compassOffset + rot) % 360;
+        // Live wedge follows ROT_SIGN-adjusted rotation
+        const bearing = (compassOffset + ROT_SIGN * rot) % 360;
         stickyBearing = bearing;                       // remember for next photo
         const pos=marker.getLatLng();
         drawOrientation(pos.lat, pos.lng, bearing, FOV_DEG, 50);
-        if (DEBUG) dbg(`live\nrot=${rot.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}`);
+        if (DEBUG) dbg(`live\nrot=${rot.toFixed(1)}°\nbearing=${bearing.toFixed(1)}°\noffset=${compassOffset.toFixed(1)}°\nsrc=${src}\nrotSign=${ROT_SIGN}`);
       }, 120);
     }
 
@@ -299,13 +299,22 @@
         viewer.on('image', async (ev)=>{
           const id=ev?.image?.id || ev?.imageId || ev?.id;
           if(!id) return;
-          await setMarkerToImage(id);   // <— move marker & (optionally) pan
-          await reanchorToSticky();     // <— keep the wedge angle from previous photo
+          const latlng = await getImageLatLng(id);
+          if(latlng){
+            marker.setLatLng(latlng);
+            if(FOLLOW_MAP && VIEW!=='image') map.setView(latlng, map.getZoom(), {animate:true});
+          }
+          await reanchorToSticky();
         });
       } catch {}
 
       await gotoImage(start.id);
-      await setMarkerToImage(start.id); // set initial marker position
+      // initial marker + anchor
+      const latlng0 = await getImageLatLng(start.id);
+      if(latlng0){
+        marker.setLatLng(latlng0);
+        if(FOLLOW_MAP && VIEW!=='image') map.setView(latlng0, map.getZoom(), {animate:true});
+      }
       await reanchorToSticky();         // anchor to START_BEARING (default 0°)
       status("");
 
