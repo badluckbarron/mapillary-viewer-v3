@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>MapillaryJS – fast pins (tile bboxes, 2k pages, canvas)</title>
+  <title>MapillaryJS — fast viewport pins (2000 page, retries, cache)</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -18,197 +18,171 @@
     #wrap { height: 100vh; width: 100%; }
     #mly, #map { height: 100%; width: 100%; }
     #msg { position: absolute; top: 8px; left: 8px; z-index: 1000;
-           background: rgba(0,0,0,.6); color: #fff; padding: 6px 10px; border-radius: 6px;
+           background: rgba(0,0,0,.72); color: #fff; padding: 6px 10px; border-radius: 6px;
            font: 13px/1.4 system-ui, sans-serif; white-space: pre-line; }
-    #dbg { position: absolute; top: 8px; right: 8px; z-index: 1000;
-           background: rgba(20,20,20,.72); color: #9ef; padding: 6px 10px; border-radius: 6px;
-           font: 12px/1.35 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; display:none; }
-    .image-only { display:block; position:relative; }
-    .image-only #map { display:none; }
-    .map-only { display:block; }
-    .map-only #mly { display:none; }
     .split { display:grid; grid-template-columns:1fr 1fr; }
     .split #mly, .split #map { display:block; }
   </style>
 </head>
 <body>
   <div id="wrap" class="split">
-    <div id="mly" aria-label="Mapillary viewer"></div>
-    <div id="map" aria-label="Map"></div>
-    <div id="msg"></div>
-    <pre id="dbg"></pre>
+    <div id="mly"></div>
+    <div id="map"></div>
+    <div id="msg">Loading…</div>
   </div>
 
   <script>
-    // ------------------ Query/options ------------------
+    // ------------------ CONFIG ------------------
     const qs = new URLSearchParams(location.search);
 
-    // Your token can be URL-encoded; decode to "MLY|..."
+    // token can be URL-encoded; decode -> MLY|...
     const RAW_TOKEN = "MLY%7C24840280672250420%7C6fc0e204403850a11ccc043866f1b01d";
-    const TOKEN = decode(RAW_TOKEN);
+    const TOKEN = decodeURIComponent(RAW_TOKEN);
 
-    const defaults = {
-      lat: Number(30.138307),
-      lng: Number(-91.965153),
-      z:   Number(16),
-      username: "HKocen"
-    };
+    // viewer + user filters
+    const USERNAME = "HKocen";
+    const START_IMAGE_ID = (qs.get("image") || "744575191439794").trim();
 
-    // Optional date filters via URL, e.g. ?after=2025-06-01&before=2025-12-31
+    // date filters via URL
     const AFTER  = qs.get("after")  && /^\d{4}-\d{2}-\d{2}$/.test(qs.get("after"))  ? qs.get("after")  + "T00:00:00Z" : "";
     const BEFORE = qs.get("before") && /^\d{4}-\d{2}-\d{2}$/.test(qs.get("before")) ? qs.get("before") + "T23:59:59Z" : "";
 
-    const VIEW          = "split";                   // image | map | split
-    const SHOW_PINS     = true;                      // show pins
-    const FOV_DEG       = Number(60);
-    const DEBUG         = qs.get("debug") === "1";
+    // perf knobs
+    const PAGE_LIMIT       = 2000;   // Mapillary docs: default & max 2000
+    const MAX_PINS_TOTAL   = 5000;   // cap per refresh
+    const TILE_TARGET_AREA = 0.009;  // deg^2 (must be < 0.01)
+    const MAX_TILES        = 512;    // guardrail
+    const CONCURRENCY      = 8;      // parallel tile fetches
+    const DEBOUNCE_MS      = 250;    // map move debounce
+    const RETRIES          = 3;      // retry for 5xx
+    const RETRY_BASE_MS    = 300;    // backoff base
+    const CACHE_TTL_MS     = 5 * 60 * 1000; // 5 minutes
+    const MOVE_HYSTERESIS  = 0.15;   // require ~15% bounds change to refetch
 
-    // page + tiling perf knobs
-    const MAX_PINS_TOTAL   = 5000;        // cap per refresh
-    const PAGE_LIMIT       = 2000;        // docs: default/max 2000
-    const TILE_TARGET_AREA = 0.009;       // deg² (must be < 0.01 per docs)
-    const MAX_TILES        = 512;         // guardrail
-    const CONCURRENCY      = 8;           // parallel tile fetchers
-    const DEBOUNCE_MS      = 250;
+    // map start
+    const START = { lat: 30.138307, lng: -91.965153, zoom: 14 };
 
-    // Start on this image if provided:
-    const START_IMAGE_ID = (qs.get("image") || "744575191439794").trim();
+    const $msg = (t)=>{ document.getElementById('msg').textContent = t || ""; };
 
-    const status = (t)=>{ document.getElementById('msg').textContent = t || ""; };
-    const dbg    = (t)=>{ const el=document.getElementById('dbg'); if (DEBUG){ el.style.display='block'; el.textContent=t; } };
-
-    // ------------------ Layout ------------------
-    const wrap = document.getElementById('wrap');
-    wrap.className = VIEW === 'split' ? 'split' : (VIEW === 'map' ? 'map-only' : 'image-only');
-
-    const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-    const nextFrame = ()=>new Promise(r=>requestAnimationFrame(()=>requestAnimationFrame(r)));
-
-    // ------------------ Leaflet map ------------------
-    const map = L.map('map', { zoomControl:true, attributionControl:true });
+    // ------------------ MAP ------------------
+    const map = L.map('map', { zoomControl: true, attributionControl: true });
     L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
       maxZoom: 19, attribution: '&copy; OpenStreetMap contributors'
     }).addTo(map);
-    const startLatLng = [defaults.lat, defaults.lng];
-    const initialZoom = Math.max(0, (defaults.z || 16) - 2);
-    map.setView(startLatLng, initialZoom);
+    map.setView([START.lat, START.lng], START.zoom);
 
-    // Use a shared Canvas renderer (much faster for lots of circles than SVG)
     const canvasRenderer = L.canvas({ padding: 0.5 });
-
-    const marker = L.marker(startLatLng, { draggable:false }).addTo(map);
     const pinLayer = L.featureGroup([], { renderer: canvasRenderer }).addTo(map);
-    const orientationLayer = L.layerGroup().addTo(map);
+    const marker = L.marker([START.lat, START.lng]).addTo(map);
 
-    const defaultPinStyle = {
-      radius: 3.5, color: '#1b5e20', weight: 2, opacity: 1,
-      fillColor: '#2ecc71', fillOpacity: 0.9, renderer: canvasRenderer
-    };
+    const pinStyle = { radius: 3.5, color: '#1b5e20', weight: 2, opacity: 1, fillColor: '#2ecc71', fillOpacity: 0.9, renderer: canvasRenderer };
+    const pinStyleSel = { radius: 8, color: '#e53935', weight: 3, opacity: 1, fillColor: '#ffcdd2', fillOpacity: 1.0, renderer: canvasRenderer };
 
-    const selectedPinStyle = {
-      radius: 8, color: '#e53935', weight: 3, opacity: 1,
-      fillColor: '#ffcdd2', fillOpacity: 1.0, renderer: canvasRenderer
-    };
-
-    let pinsById = new Map();
-    let selectedPin = null;
-
-    function styleDefault(layer){ try{ layer.setStyle(defaultPinStyle); }catch{} }
-    function styleSelected(layer){ try{ layer.setStyle(selectedPinStyle); layer.bringToFront(); }catch{} }
-    function selectPinById(imageId){
-      const lyr = pinsById.get(imageId);
-      if(!lyr) return;
-      if(selectedPin && selectedPin !== lyr) styleDefault(selectedPin);
+    let selectedPin = null, pinsById = new Map();
+    const styleDefault  = (lyr)=>{ try{ lyr.setStyle(pinStyle); }catch{} };
+    const styleSelected = (lyr)=>{ try{ lyr.setStyle(pinStyleSel); lyr.bringToFront(); }catch{} };
+    function selectPinById(id){
+      const lyr = pinsById.get(id);
+      if (!lyr) return;
+      if (selectedPin && selectedPin !== lyr) styleDefault(selectedPin);
       styleSelected(lyr);
       selectedPin = lyr;
     }
 
-    // ------------------ Helpers ------------------
-    function clampLon(x){ return Math.max(-180, Math.min(180, x)); }
-    function clampLat(y){ return Math.max(-85, Math.min(85, y)); }
-    function bboxFromMap(m){
-      const b=m.getBounds(), sw=b.getSouthWest(), ne=b.getNorthEast();
-      const W=clampLon(sw.lng), S=clampLat(sw.lat), E=clampLon(ne.lng), N=clampLat(ne.lat);
-      return [W,S,E,N];
+    // ------------------ UTIL ------------------
+    const clampLon = x => Math.max(-180, Math.min(180, x));
+    const clampLat = y => Math.max(-85,  Math.min(85,  y));
+    function bboxFromMap(){
+      const b = map.getBounds(); const sw = b.getSouthWest(), ne = b.getNorthEast();
+      return [clampLon(sw.lng), clampLat(sw.lat), clampLon(ne.lng), clampLat(ne.lat)];
     }
-    function bboxArea([W,S,E,N]){ return Math.max(0,E-W)*Math.max(0,N-S); }
-    function splitBbox([W,S,E,N]){
-      const mx=(W+E)/2, my=(S+N)/2;
-      return [[W,S,mx,my],[mx,S,E,my],[W,my,mx,N],[mx,my,E,N]];
-    }
-
-    // Build a set of small bboxes (< 0.01 deg²) covering the viewport
+    const bboxArea = ([W,S,E,N]) => Math.max(0,E-W) * Math.max(0,N-S);
+    const splitBbox = ([W,S,E,N]) => { const mx=(W+E)/2, my=(S+N)/2; return [[W,S,mx,my],[mx,S,E,my],[W,my,mx,N],[mx,my,E,N]]; };
     function tileViewportBboxes(viewBbox){
-      const out = [];
-      const q = [viewBbox];
-      while (q.length && out.length < MAX_TILES){
-        const b = q.shift();
-        if (bboxArea(b) <= TILE_TARGET_AREA) { out.push(b); continue; }
-        q.push(...splitBbox(b));
+      const out=[], q=[viewBbox];
+      while(q.length && out.length<MAX_TILES){
+        const b=q.shift();
+        if (bboxArea(b) <= TILE_TARGET_AREA) out.push(b); else q.push(...splitBbox(b));
       }
       return out;
     }
 
-    function destPoint(lat,lng,bearingDeg,meters){
-      const R=6371000, br=bearingDeg*Math.PI/180;
-      const φ1=lat*Math.PI/180, λ1=lng*Math.PI/180, δ=meters/R;
-      const φ2=Math.asin(Math.sin(φ1)*Math.cos(δ)+Math.cos(φ1)*Math.sin(δ)*Math.cos(br));
-      const λ2=λ1+Math.atan2(Math.sin(br)*Math.sin(δ)*Math.cos(φ1), Math.cos(δ)-Math.sin(φ1)*Math.sin(φ2));
-      return [φ2*180/Math.PI, ((λ2*180/Math.PI+540)%360)-180];
-    }
-    function drawOrientation(lat,lng,bearingDeg,fovDeg=FOV_DEG,length=50){
-      orientationLayer.clearLayers();
-      if(typeof bearingDeg!=='number') return;
-      const left=bearingDeg-fovDeg/2, right=bearingDeg+fovDeg/2;
-      const tip=destPoint(lat,lng,bearingDeg,length);
-      const pLeft=destPoint(lat,lng,left,length);
-      const pRight=destPoint(lat,lng,right,length);
-      L.polygon([[lat,lng],pLeft,pRight],{color:'#1976d2',weight:1,fillColor:'#1976d2',fillOpacity:.18}).addTo(orientationLayer);
-      L.polyline([[lat,lng],tip],{color:'#1976d2',weight:2,opacity:.9}).addTo(orientationLayer);
+    // Move hysteresis (skip tiny shifts)
+    let lastBbox = null;
+    function bboxChangedEnough(prev, curr){
+      if (!prev) return true;
+      const pb = L.latLngBounds([prev[1],prev[0]],[prev[3],prev[2]]);
+      const cb = L.latLngBounds([curr[1],curr[0]],[curr[3],curr[2]]);
+      const inter = pb.intersection(cb);
+      if (!inter) return true;
+      const aPrev = pb.getSize().x * pb.getSize().y;
+      const aInt  = inter.getSize().x * inter.getSize().y;
+      const overlap = aInt / aPrev;         // fraction of old bbox still visible
+      return (1 - overlap) > MOVE_HYSTERESIS;
     }
 
-    // ------------------ Graph API (faster + resilient) ------------------
+    // ------------------ GRAPH API ------------------
     function buildImagesURL({bbox, limit}){
       const [W,S,E,N] = bbox.map(v => +v.toFixed(7));
       const u = new URL("https://graph.mapillary.com/images");
       u.searchParams.set("fields", "id,computed_geometry");
-      u.searchParams.set("bbox", `${W},${S},${E},${N}`);  // west,south,east,north
+      u.searchParams.set("bbox", `${W},${S},${E},${N}`);  // W,S,E,N
       u.searchParams.set("limit", String(Math.min(PAGE_LIMIT, limit)));
       u.searchParams.set("access_token", TOKEN);
-      if (defaults.username) u.searchParams.set("creator_username", defaults.username);
+      u.searchParams.set("creator_username", USERNAME);
       if (AFTER)  u.searchParams.set("start_captured_at", AFTER);
       if (BEFORE) u.searchParams.set("end_captured_at", BEFORE);
       return u;
     }
 
+    const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
+    async function fetchWithRetry(url, {signal, tries=RETRIES}={}){
+      for (let i=0;i<tries;i++){
+        const res = await fetch(url, { signal });
+        if (res.ok) return res;
+        // Only back off on 5xx; surface 4xx immediately
+        if (res.status >= 500) {
+          const jitter = 0.5 + Math.random();
+          await sleep(RETRY_BASE_MS * Math.pow(2,i) * jitter);
+          continue;
+        } else {
+          const txt = await res.text().catch(()=>res.statusText);
+          throw new Error(`${res.status} ${txt}`);
+        }
+      }
+      const txt = `${url}`;
+      throw new Error(`retry-exhausted for ${txt}`);
+    }
+
     async function fetchTile({bbox, cap, signal}){
       const bboxStr = bbox.map(v => +v.toFixed(7)).join(",");
+      const first = buildImagesURL({bbox, limit: Math.min(PAGE_LIMIT, cap)});
       let out = [];
-      let url = buildImagesURL({bbox, limit: Math.min(PAGE_LIMIT, cap)});
+      let url = first;
 
       while (url && out.length < cap){
-        const res = await fetch(url, { signal });
-        if (!res.ok){
-          const t = await res.text().catch(()=>res.statusText);
-          throw new Error(`API ${res.status} ${t}`);
-        }
+        const res = await fetchWithRetry(url, { signal });
         const j = await res.json();
-        if (Array.isArray(j.data)) out.push(...j.data);
+
+        const data = Array.isArray(j.data) ? j.data : [];
+        for (const d of data){
+          const c = d?.computed_geometry?.coordinates;
+          if (Array.isArray(c) && c.length===2) out.push({ id: d.id, lng: c[0], lat: c[1] });
+          if (out.length >= cap) break;
+        }
 
         const next = j?.paging?.next;
-        if (next && out.length < cap) {
+        if (next && out.length < cap){
           url = new URL(next);
 
-          // Re-attach filters the API might drop (esp. bbox)
+          // Re-attach filters (esp. bbox) + tighten limit
           if (!url.searchParams.get("access_token"))      url.searchParams.set("access_token", TOKEN);
-          if (!url.searchParams.get("fields"))            url.searchParams.set("fields", "id,computed_geometry");
-          if (!url.searchParams.get("creator_username") && defaults.username)
-            url.searchParams.set("creator_username", defaults.username);
+          if (!url.searchParams.get("fields"))            url.searchParams.set("fields","id,computed_geometry");
+          if (!url.searchParams.get("creator_username"))  url.searchParams.set("creator_username", USERNAME);
           if (!url.searchParams.get("start_captured_at") && AFTER)  url.searchParams.set("start_captured_at", AFTER);
           if (!url.searchParams.get("end_captured_at")   && BEFORE) url.searchParams.set("end_captured_at", BEFORE);
-          if (!url.searchParams.get("bbox"))                        url.searchParams.set("bbox", bboxStr);
+          if (!url.searchParams.get("bbox"))              url.searchParams.set("bbox", bboxStr);
 
-          // Tighten the next page limit to remaining budget
           const remaining = cap - out.length;
           url.searchParams.set("limit", String(Math.min(PAGE_LIMIT, remaining)));
         } else {
@@ -218,224 +192,145 @@
       return out.slice(0, cap);
     }
 
-    let currentAbort = null;
+    // ------------------ CACHE (per-bbox) ------------------
+    const tileCache = new Map();  // key=bboxStr, val={ts,data, promise}
+    function keyOf(b){ return b.map(v=>+v.toFixed(7)).join(","); }
+    function getCached(b){
+      const k = keyOf(b); const v = tileCache.get(k);
+      if (!v) return null;
+      if (v.promise) return v; // in-flight
+      if (Date.now() - v.ts > CACHE_TTL_MS) { tileCache.delete(k); return null; }
+      return v;
+    }
+    function setCached(b, data){
+      const k = keyOf(b);
+      tileCache.set(k, { ts: Date.now(), data });
+    }
+    function setPending(b, promise){
+      const k = keyOf(b);
+      tileCache.set(k, { promise });
+    }
+
+    // ------------------ PIN LOADER ------------------
+    let aborter = null;
 
     async function drawPinsForView(){
-      if (!TOKEN || !SHOW_PINS) return;
+      const currBbox = bboxFromMap();
+      if (!bboxChangedEnough(lastBbox, currBbox)) return;   // tiny move -> skip
+      lastBbox = currBbox.slice();
 
-      // Cancel previous refresh
-      if (currentAbort) currentAbort.abort();
-      currentAbort = new AbortController();
-      const { signal } = currentAbort;
+      if (aborter) aborter.abort();
+      aborter = new AbortController();
+      const { signal } = aborter;
 
-      const t0 = performance.now();
-      const tiles = tileViewportBboxes(bboxFromMap(map));
-      status(`Loading pins… tiles: ${tiles.length}\nUser: ${defaults.username}${AFTER?`\nAfter: ${AFTER}`:""}${BEFORE?`\nBefore: ${BEFORE}`:""}`);
+      const tiles = tileViewportBboxes(currBbox);
+      $msg(`Loading pins… tiles: ${tiles.length}\nUser: ${USERNAME}${AFTER?`\nAfter: ${AFTER}`:""}${BEFORE?`\nBefore: ${BEFORE}`:""}`);
 
-      // Parallel tile fetching with a global cap
-      const seen = new Set();
       let remaining = MAX_PINS_TOTAL;
-      let index = 0;
       const results = [];
+      const seen = new Set();
 
+      let idx = 0;
       async function worker(){
-        while (!signal.aborted && remaining > 0 && index < tiles.length){
-          const my = index++;
+        while (!signal.aborted && remaining > 0 && idx < tiles.length){
+          const i = idx++; const bbox = tiles[i];
           const capForTile = Math.min(PAGE_LIMIT, remaining);
-          try{
-            const data = await fetchTile({bbox: tiles[my], cap: capForTile, signal});
-            for (const d of data){
-              const id = d?.id;
-              const c = d?.computed_geometry?.coordinates;
-              if (!id || !Array.isArray(c)) continue;
-              if (seen.has(id)) continue;
-              seen.add(id);
-              results.push({ id, lng: c[0], lat: c[1] });
-              remaining--;
-              if (remaining <= 0) break;
+
+          // cache / in-flight de-dupe
+          const cached = getCached(bbox);
+          if (cached && cached.data){
+            for (const r of cached.data) {
+              if (seen.has(r.id)) continue;
+              seen.add(r.id); results.push(r); remaining--; if (remaining<=0) break;
             }
-          }catch(e){
-            if (!signal.aborted) console.warn("Tile failed:", e.message || e);
+            continue;
+          }
+          if (cached && cached.promise){
+            try{
+              const data = await cached.promise;
+              for (const r of data) {
+                if (seen.has(r.id)) continue;
+                seen.add(r.id); results.push(r); remaining--; if (remaining<=0) break;
+              }
+              continue;
+            }catch{ /* ignore failed in-flight */ }
+          }
+
+          // fetch with retry + cache
+          const p = (async()=>{
+            try {
+              const data = await fetchTile({ bbox, cap: capForTile, signal });
+              setCached(bbox, data);
+              return data;
+            } catch (e) {
+              // Failed tile — cache empty result for a short time to avoid hammering
+              setCached(bbox, []);
+              console.warn("Tile failed:", e.message || e);
+              return [];
+            }
+          })();
+          setPending(bbox, p);
+
+          const data = await p;
+          for (const r of data){
+            if (seen.has(r.id)) continue;
+            seen.add(r.id); results.push(r); remaining--; if (remaining<=0) break;
           }
         }
       }
+
       const workers = Array.from({length: Math.min(CONCURRENCY, tiles.length)}, worker);
       await Promise.all(workers).catch(()=>{});
-
       if (signal.aborted) return;
 
-      // (Re)draw pins fast with Canvas renderer
+      // draw (Canvas)
       pinLayer.clearLayers(); pinsById.clear(); selectedPin = null;
-
-      results.forEach(r=>{
+      for (const r of results){
         const latlng = [r.lat, r.lng];
-        const pin = L.circleMarker(latlng, defaultPinStyle)
-          .on('click', async (e)=>{
+        const cm = L.circleMarker(latlng, pinStyle)
+          .on("click", async (e)=>{
             L.DomEvent.stop(e);
             selectPinById(r.id);
             await gotoImage(r.id, latlng);
           });
-        pinLayer.addLayer(pin);
-        pinsById.set(r.id, pin);
-      });
-
-      const ms = Math.round(performance.now() - t0);
+        pinLayer.addLayer(cm);
+        pinsById.set(r.id, cm);
+      }
       const capped = results.length >= MAX_PINS_TOTAL ? " (capped)" : "";
-      status(`Pins: ${results.length}${capped}\nTiles: ${tiles.length}\nTime: ${ms} ms`);
+      $msg(`Pins: ${results.length}${capped}\nTiles: ${tiles.length}`);
     }
 
-    let pinTimer=null;
-    map.on('moveend', ()=>{ if(!SHOW_PINS) return; clearTimeout(pinTimer); pinTimer=setTimeout(drawPinsForView, DEBOUNCE_MS); });
+    let timer=null;
+    map.on("moveend", ()=>{ clearTimeout(timer); timer=setTimeout(drawPinsForView, DEBOUNCE_MS); });
 
-    // ------------------ Viewer + sticky wedge ------------------
-    function getRotationDeg(rootEl){
-      if(!rootEl) return null;
-      const q=[rootEl]; let depth=0, nextBreak=1, count=0, maxDepth=3;
-      while(q.length && depth<=maxDepth){
-        const el=q.shift();
-        const t=getComputedStyle(el).transform || el.style?.transform || '';
-        const deg=parseTransformToDeg(t); if(deg!=null) return (deg+360)%360;
-        for(const ch of el.children||[]) q.push(ch);
-        count++; if(count===nextBreak){ depth++; nextBreak=q.length+count; }
-      }
-      return null;
-      function parseTransformToDeg(tr){
-        if(!tr || tr==='none') return null;
-        const r=/rotate[Z]?\(\s*([-+0-9.]+)\s*(deg|rad)\s*\)/i.exec(tr);
-        if(r){ const v=parseFloat(r[1]); return r[2].toLowerCase()==='rad'? v*180/Math.PI : v; }
-        const m2=/^matrix\(\s*([-+0-9eE.,\s]+)\)$/.exec(tr);
-        if(m2){ const [a,b]=m2[1].split(',').map(x=>parseFloat(x)); return Math.atan2(b,a)*180/Math.PI; }
-        const m3=/^matrix3d\(\s*([-+0-9eE.,\s]+)\)$/.exec(tr);
-        if(m3){ const p=m3[1].split(',').map(x=>parseFloat(x)); return Math.atan2(p[1],p[0])*180/Math.PI; }
-        return null;
-      }
-    }
-    function getCompassRotation(){
-      const host=document.getElementById('mly');
-      const trySel=(sel,src)=>{ const el=host && host.querySelector(sel); const deg=getRotationDeg(el);
-        return deg!=null ? {rot:((deg%360)+360)%360, src} : null; };
-      return (
-        trySel('.mapillary-bearing-indicator-background','bg') ||
-        trySel('.mapillary-bearing-indicator-background-arrow','bg-arrow') ||
-        trySel('.mapillary-bearing-north-container','north') ||
-        trySel('[class*="bearing"]','fallback') ||
-        {rot:null, src:'none'}
-      );
-    }
+    // ------------------ VIEWER ------------------
+    const viewer = new mapillary.Viewer({ container: "mly", accessToken: TOKEN, imageId: START_IMAGE_ID, component: { cover: false, direction: true, zoom: true } });
 
-    let viewer, navLock=0;
-    let compassOffset=0;
-    let stickyBearing=((Number(qs.get("bearing")) || 270)+360)%360;
-    let suspendWatcher=false;
-
-    async function reanchorToSticky(){
-      suspendWatcher = true;
-      await nextFrame();
-      const {rot} = getCompassRotation();
-      if(rot!=null){
-        compassOffset = ((stickyBearing - (-1) * rot) % 360 + 360) % 360;
-        const p=marker.getLatLng();
-        drawOrientation(p.lat, p.lng, stickyBearing, FOV_DEG, 50);
-      }
-      suspendWatcher = false;
-    }
-
-    function startCompassWatcher(){
-      setInterval(()=>{
-        if(suspendWatcher) return;
-        const {rot} = getCompassRotation();
-        if(rot==null) return;
-        const bearing = (compassOffset + (-1) * rot) % 360;
-        stickyBearing = bearing;
-        const pos=marker.getLatLng();
-        drawOrientation(pos.lat, pos.lng, bearing, FOV_DEG, 50);
-      }, 120);
+    async function getImageLatLng(id){
+      const u = new URL(`https://graph.mapillary.com/${id}`);
+      u.searchParams.set("fields","computed_geometry");
+      u.searchParams.set("access_token", TOKEN);
+      try{
+        const r = await fetchWithRetry(u, { tries: 2 });
+        const j = await r.json();
+        const c = j?.computed_geometry?.coordinates;
+        return (Array.isArray(c) && c.length===2) ? [c[1], c[0]] : null;
+      }catch{ return null; }
     }
 
     async function gotoImage(id, latlngHint){
-      const my=++navLock;
       try{ await viewer.setFilter(["all"]); }catch{}
-      try{
-        suspendWatcher = true;
-        await viewer.moveTo(id);
-
-        if (SHOW_PINS) selectPinById(id);
-
-        const ll = latlngHint || await getImageLatLng(id);
-        if(ll){
-          marker.setLatLng(ll);
-          map.setView(ll, map.getZoom(), {animate:true});
-        }
-      } finally {
-        if(navLock===my) navLock=0;
-      }
+      await viewer.moveTo(id).catch(()=>{});
+      const ll = latlngHint || await getImageLatLng(id);
+      if (ll) { marker.setLatLng(ll); map.setView(ll, map.getZoom(), { animate:true }); }
     }
 
-    async function findImageNear({lat,lng}){
-      const url=new URL("https://graph.mapillary.com/images");
-      url.searchParams.set("fields","id,computed_geometry");
-      url.searchParams.set("closeto", `${lng},${lat}`);
-      url.searchParams.set("radius", "50");
-      url.searchParams.set("limit","1");
-      if (defaults.username) url.searchParams.set("creator_username", defaults.username);
-      if (AFTER)  url.searchParams.set("start_captured_at", AFTER);
-      if (BEFORE) url.searchParams.set("end_captured_at", BEFORE);
-      url.searchParams.set("access_token", TOKEN);
-      const res=await fetch(url);
-      if(!res.ok){ throw new Error(`API ${res.status}`); }
-      const j=await res.json(); return j?.data?.[0] ?? null;
-    }
-
-    async function getImageLatLng(imageId){
-      const u=new URL(`https://graph.mapillary.com/${imageId}`);
-      u.searchParams.set("fields","computed_geometry");
-      u.searchParams.set("access_token", TOKEN);
-      const res=await fetch(u);
-      if(!res.ok) return null;
-      const j=await res.json();
-      const c=j?.computed_geometry?.coordinates;
-      return Array.isArray(c) && c.length===2 ? [c[1], c[0]] : null;
-    }
-
-    // ------------------ Init ------------------
+    // initial load
     (async function init(){
-      if(!TOKEN){ status("Add ?token=YOUR_TOKEN"); return; }
-      const M=window.Mapillary || window.mapillary || window.mapillaryjs;
-      const ViewerCtor=M && M.Viewer;
-      if(!ViewerCtor){ status("Mapillary library failed to load."); return; }
-
-      viewer=new ViewerCtor({ container:"mly", accessToken:TOKEN });
-      try{ viewer.setFieldOfView(FOV_DEG); }catch{}
-
       try {
-        viewer.on('image', async (ev)=>{
-          const id=ev?.image?.id || ev?.imageId || ev?.id;
-          if(!id) return;
-          const latlng = await getImageLatLng(id);
-          if(latlng){
-            marker.setLatLng(latlng);
-            map.setView(latlng, map.getZoom(), {animate:true});
-          }
-          if (SHOW_PINS) selectPinById(id);
-          await reanchorToSticky();
-        });
+        await viewer.moveTo(START_IMAGE_ID);
       } catch {}
-
-      try{
-        status(`Opening image ${START_IMAGE_ID}…`);
-        await gotoImage(START_IMAGE_ID);
-      }catch(e){
-        status("Searching for a nearby image…");
-        const start=await findImageNear({lat:defaults.lat, lng:defaults.lng});
-        if(!start){ status(`No imagery by "${defaults.username}" near start.`); return; }
-        await gotoImage(start.id);
-      }
-
-      await reanchorToSticky();
-      status("");
-
-      startCompassWatcher();
-      if(SHOW_PINS) drawPinsForView();
+      drawPinsForView();
     })();
   </script>
 </body>
