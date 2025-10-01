@@ -2,7 +2,7 @@
 <html>
 <head>
   <meta charset="utf-8" />
-  <title>Mapillary – Hybrid (Tiles → ID batches) HKocen after 2025-06-01</title>
+  <title>Mapillary – Hybrid (Tiles → ID batches) with safe IDs</title>
   <meta name="viewport" content="width=device-width, initial-scale=1" />
 
   <!-- MapillaryJS -->
@@ -19,13 +19,9 @@
     #viewer, #map { position: absolute; top: 0; height: 100%; }
     #viewer { left: 0; width: 61.8%; }
     #map    { right: 0; width: calc(38.2% - 2px); }
-
-    #msg {
-      position: absolute; left: 8px; top: 8px; z-index: 1000;
-      background: rgba(0,0,0,.72); color:#fff; padding:6px 10px; border-radius:6px;
-      font: 13px/1.3 system-ui, sans-serif; white-space: pre-line;
-      max-width: min(52vw, 780px);
-    }
+    #msg { position:absolute; left:8px; top:8px; z-index:1000; background:rgba(0,0,0,.72);
+           color:#fff; padding:6px 10px; border-radius:6px; font:13px/1.3 system-ui,sans-serif;
+           white-space:pre-line; max-width:min(52vw,780px); }
     #msg.error { background: rgba(160,0,0,.85); }
   </style>
 </head>
@@ -38,21 +34,23 @@
 
   <script>
     // ===== CONFIG =====
-    const TOKEN       = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
-    const START_ID    = "744575191439794";
-    const USERNAME    = "HKocen";
-    const AFTER       = "2025-06-01T00:00:00Z"; // after May 31, 2025
+    const TOKEN    = "MLY|24840280672250420|6fc0e204403850a11ccc043866f1b01d";
+    const START_ID = "744575191439794";
 
-    // how many candidates to consider per refresh (from tile layer)
-    const CANDIDATE_LIMIT = 8000;
-    // how many filtered pins to finally display
-    const MAX_FILTERED    = 5000;
+    const USERNAME = "HKocen";
+    const AFTER    = "2025-06-01T00:00:00Z"; // after May 31, 2025
 
-    // batch / concurrency
-    const BATCH_SIZE      = 100; // ids per /images?ids=… request
-    const CONCURRENCY     = 6;   // parallel batches
-    const MIN_ZOOM_TO_SCAN= 14;  // image tiles appear from z>=14
-    const DEBOUNCE_MS     = 250;
+    // Tile → ID sampling + filtering limits
+    const CANDIDATE_LIMIT = 8000;  // max visible candidates read from tiles
+    const MAX_FILTERED    = 5000;  // final pins to render
+
+    // Graph batching
+    const BATCH_SIZE   = 100;      // ids per request
+    const CONCURRENCY  = 6;        // parallel requests
+    const MIN_ZOOM_TO_SCAN = 14;
+    const DEBOUNCE_MS  = 250;
+
+    const FIELDS = "id,creator,captured_at,computed_geometry"; // exact fields, no typos
 
     const $msg = document.getElementById("msg");
     const status = (t, err=false)=>{ $msg.textContent=t||""; $msg.classList.toggle("error", !!err); };
@@ -68,7 +66,6 @@
     // ===== Map (right) =====
     const style = {
       "version": 8,
-      "name": "OSM + Mapillary tiles",
       "glyphs": "https://demotiles.maplibre.org/font/{fontstack}/{range}.pbf",
       "sources": {
         "osm": {
@@ -77,7 +74,6 @@
           "tileSize": 256, "minzoom": 0, "maxzoom": 19,
           "attribution": "© OpenStreetMap contributors"
         },
-        // Mapillary vector tiles (public)
         "mapillary": {
           "type": "vector",
           "tiles": [
@@ -100,9 +96,8 @@
       zoom: 15
     });
 
-    // Set up layers: sequences for context, faint "all images" for ID querying,
-    // and a GeoJSON source/layer for our filtered pins.
     map.on("load", () => {
+      // sequences for context
       map.addLayer({
         id: "mly-sequences",
         type: "line",
@@ -116,6 +111,7 @@
         }
       });
 
+      // faint all-image dots for querying IDs
       map.addLayer({
         id: "mly-images-all",
         type: "circle",
@@ -129,6 +125,7 @@
         }
       });
 
+      // filtered pins layer
       map.addSource("filteredPins", {
         type: "geojson",
         data: { type:"FeatureCollection", features: [] }
@@ -156,77 +153,92 @@
       refreshFilteredPins();
     });
 
-    // ===== Collect visible image IDs from tiles =====
+    // ===== Safe ID extraction from tiles =====
+    function toSafeIdString(props){
+      // Prefer string key fields from tiles (no precision loss)
+      const key = props?.key || props?.image_key || props?.imageId || props?.image_id;
+      if (key) return String(key);
+
+      // Fall back to numeric id ONLY if it’s a safe integer
+      const n = props?.id;
+      if (typeof n === "number" && Number.isSafeInteger(n)) return String(n);
+
+      // Some tiles expose an 'id' as string already – keep it
+      if (typeof props?.id === "string") return props.id;
+
+      return null; // unsafe → skip
+    }
+
     function getVisibleImageIds() {
       if (map.getZoom() < MIN_ZOOM_TO_SCAN) return [];
       const feats = map.queryRenderedFeatures({ layers: ["mly-images-all"] });
+
       const ids = [];
       const seen = new Set();
-
-      // Sample up to CANDIDATE_LIMIT, dedup by various possible id keys
       const step = Math.max(1, Math.floor(feats.length / CANDIDATE_LIMIT));
+
       for (let i = 0; i < feats.length; i += step) {
         const f = feats[i];
-        const id =
-          f.properties?.id ||
-          f.properties?.image_id ||
-          f.properties?.key ||
-          null;
-        if (!id || seen.has(id)) continue;
-        seen.add(id);
-        ids.push(String(id));
+        const idStr = toSafeIdString(f.properties || {});
+        if (!idStr || seen.has(idStr)) continue;
+        seen.add(idStr);
+        ids.push(idStr);
         if (ids.length >= CANDIDATE_LIMIT) break;
       }
       return ids;
     }
 
-    // ===== Graph API: batched metadata by ID (no bbox) =====
-    async function fetchBatch(ids) {
+    // ===== Graph API batching (always /images?ids=…) =====
+    async function fetchIdsChunk(ids){
       const u = new URL("https://graph.mapillary.com/images");
       u.searchParams.set("ids", ids.join(","));
-      u.searchParams.set("fields", "id,creator,captured_at,computed_geometry");
+      u.searchParams.set("fields", FIELDS);
       u.searchParams.set("access_token", TOKEN);
       const r = await fetch(u);
-      if (!r.ok) throw new Error(`Batch ${r.status}`);
+      if (!r.ok) throw new Error(`${r.status}`);
       const j = await r.json();
-
-      // normalize: j.data may be an array
       return Array.isArray(j.data) ? j.data : [];
     }
 
-    async function fetchMetaForIds(ids) {
+    // Split batches recursively if a chunk fails, down to size 1.
+    async function fetchMetaForIds(ids){
       const out = [];
       let idx = 0;
-      const results = [];
 
       async function worker(){
-        while (idx < ids.length) {
-          const chunk = ids.slice(idx, idx += BATCH_SIZE);
-          try {
-            const arr = await fetchBatch(chunk);
-            results.push(...arr);
-          } catch (e) {
-            // fallback: fetch individual IDs if a batch fails
-            for (const id of chunk) {
-              try {
-                const u = new URL(`https://graph.mapillary.com/${id}`);
-                u.searchParams.set("fields", "id,creator,captured_at,computed_geometry");
-                u.searchParams.set("access_token", TOKEN);
-                const r = await fetch(u);
-                if (r.ok) results.push(await r.json());
-              } catch {}
+        while (idx < ids.length){
+          const start = idx;
+          const end   = Math.min(ids.length, start + BATCH_SIZE);
+          idx = end;
+          const chunk = ids.slice(start, end);
+
+          // recursive fetch with split-on-error
+          async function fetchSplit(list){
+            if (list.length === 0) return;
+            try {
+              const arr = await fetchIdsChunk(list);
+              out.push(...arr);
+            } catch (e) {
+              if (list.length === 1) {
+                // give up on this id; it may have been imprecise or removed
+                // console.warn("Skip id", list[0], e.message);
+                return;
+              }
+              const mid = Math.floor(list.length/2);
+              await fetchSplit(list.slice(0, mid));
+              await fetchSplit(list.slice(mid));
             }
           }
+          await fetchSplit(chunk);
         }
       }
       await Promise.all(Array.from({length: Math.min(CONCURRENCY, Math.ceil(ids.length/BATCH_SIZE))}, worker));
-      return results;
+      return out;
     }
 
-    // simple metadata cache by id to avoid re-querying while panning
+    // Metadata cache (avoid re-fetching when panning)
     const metaCache = new Map(); // id -> {ts, m}
     const CACHE_TTL_MS = 5 * 60 * 1000;
-
     function getCachedMeta(ids){
       const fresh = [], missing = [];
       const now = Date.now();
@@ -247,15 +259,11 @@
 
     // ===== Main refresh =====
     let refreshTimer = null, generation = 0;
-
-    function scheduleRefresh() {
-      clearTimeout(refreshTimer);
-      refreshTimer = setTimeout(refreshFilteredPins, DEBOUNCE_MS);
-    }
+    function scheduleRefresh(){ clearTimeout(refreshTimer); refreshTimer=setTimeout(refreshFilteredPins, DEBOUNCE_MS); }
     map.on("moveend", scheduleRefresh);
     map.on("zoomend", scheduleRefresh);
 
-    async function refreshFilteredPins() {
+    async function refreshFilteredPins(){
       if (!map.getSource("filteredPins")) return;
 
       if (map.getZoom() < MIN_ZOOM_TO_SCAN) {
@@ -264,7 +272,7 @@
         return;
       }
 
-      const gen = ++generation; // soft-cancel older runs
+      const gen = ++generation;
       const ids = getVisibleImageIds();
       if (!ids.length) {
         status(`No tile points visible. Try zooming in.\nUser: ${USERNAME}\nAfter: ${AFTER}`);
@@ -273,14 +281,14 @@
       }
       status(`Scanning ${ids.length} tile points…\nFiltering for ${USERNAME} & after ${AFTER}`);
 
+      // cache-aware fetch
       const { fresh, missing } = getCachedMeta(ids.slice(0, MAX_FILTERED*2));
       let meta = fresh;
-
       if (missing.length) {
         const fetched = await fetchMetaForIds(missing);
         putCachedMeta(fetched);
         meta = meta.concat(fetched);
-        if (gen !== generation) return; // newer run started
+        if (gen !== generation) return; // superseded by a newer run
       }
 
       const cutoff = Date.parse(AFTER);
@@ -311,10 +319,9 @@
       status(`Showing ${feats.length}${capped} pins\nUser: ${USERNAME}\nAfter: ${AFTER}`);
     }
 
-    // ===== Nicety: keep a small marker in sync with the viewer =====
+    // ===== keep a small dot in sync with the viewer position (optional) =====
     const posDot = document.createElement('div'); posDot.style.cssText="width:14px;height:14px;border:3px solid #ff2a6d;border-radius:50%;background:#fff9";
     const positionMarker = new maplibregl.Marker({ element: posDot, rotationAlignment: "map" });
-
     async function syncPosition(){
       try{
         const p = await viewer.getPosition();
